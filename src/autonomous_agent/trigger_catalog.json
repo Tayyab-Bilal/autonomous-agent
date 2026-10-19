@@ -1,0 +1,84 @@
+[
+  {
+    "type": "TaskCreated",
+    "description": "a task is created"
+  },
+  {
+    "type": "TaskUpdated",
+    "description": "a task's fields change"
+  },
+  {
+    "type": "TaskCompleted",
+    "description": "a task is marked done"
+  },
+  {
+    "type": "TaskOverdue",
+    "description": "a task passes its due date"
+  },
+  {
+    "type": "TaskAssigned",
+    "description": "a task gets a new assignee"
+  },
+  {
+    "type": "CommentAdded",
+    "description": "a comment is added to a task or document"
+  },
+  {
+    "type": "ProjectCreated",
+    "description": "a project is created"
+  },
+  {
+    "type": "ProjectArchived",
+    "description": "a project is archived"
+  },
+  {
+    "type": "ProjectStatusChanged",
+    "description": "a project's status changes"
+  },
+  {
+    "type": "MilestoneReached",
+    "description": "every task in a milestone is done"
+  },
+  {
+    "type": "DocumentCreated",
+    "description": "a document is created"
+  },
+  {
+    "type": "DocumentUpdated",
+    "description": "a document is edited"
+  },
+  {
+    "type": "DocumentShared",
+    "description": "a document is shared with someone"
+  },
+  {
+    "type": "MeetingScheduled",
+    "description": "a meeting is put in the calendar"
+  },
+  {
+    "type": "MeetingStarted",
+    "description": "a meeting begins"
+  },
+  {
+    "type": "MeetingEnded",
+    "description": "a meeting ends"
+  },
+  {
+    "type": "MeetingNotesPublished",
+    "description": "meeting notes are published"
+  },
+  {
+    "type": "WorkflowCompleted",
+    "description": "another workflow finishes"
+  },
+  {
+    "type": "MemberJoined",
+    "description": "a person joins the workspace",
+    "excluded_reason": "carries no project, document or meeting id, so no plan scope can match it"
+  },
+  {
+    "type": "WorkflowFailed",
+    "description": "a workflow run fails",
+    "excluded_reason": "a plan reacting to failures could trigger itself in a loop"
+  }
+]
