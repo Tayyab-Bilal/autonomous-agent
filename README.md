@@ -6,6 +6,56 @@ A planner and executor that turn a plain-English goal into a durable plan, then 
 
 > An open-source reference implementation of a durable, resumable autonomous planner and executor. All names and data are fictional.
 
+## At a glance
+
+**What it is.** A planner and an executor. The planner turns a plain-English goal into a stored plan, and the executor runs that plan with nobody watching, inside hard limits. Every LLM, grounding service and tool here is a scripted fake, so it all runs offline.
+
+**What is built** (in this repo, working and tested)
+
+- Ground the goal, let the LLM extract only structure, build the plan in code: `src/autonomous_agent/planner.py: Planner.create_plan()`
+- Plan assembly: step ids, RRULE, triggers, scope ids from grounding only: `src/autonomous_agent/assembler.py: assemble()`, `schedule_to_rrule()`
+- Refuses plans that cannot work, with a reason: `src/autonomous_agent/assembler.py: assemble()` (`RefusalReason`)
+- Retry reuses the plan instead of a second LLM call: `src/autonomous_agent/planner.py: goal_hash()`, `src/autonomous_agent/store.py: plan_lock()`, `find_recent_plan()`
+- Run state machine with atomic claims and fencing tokens: `src/autonomous_agent/runs.py: RunManager.transition()`, `claim_for_resume()`
+- Bounded run loop (turn budget, write cap, retries, resume limit): `src/autonomous_agent/executor.py: Executor._drive()`, `ExecConfig`
+- Loop guard, soft then hard: `src/autonomous_agent/loop_guard.py: LoopGuard.check()`
+- Write ledger so a resumed write is a no-op: `src/autonomous_agent/executor.py: Executor._write()`, `idempotency_key()`
+- Final status from stored step states, not from the agent: `src/autonomous_agent/executor.py: Executor._finalise()`
+- Failure classification from the tool's response: `src/autonomous_agent/failures.py: classify_result()`
+- Approval gate: allow, block or hold: `src/autonomous_agent/gate.py: ToolPolicyGate.check()`
+- Event triggers with dedupe, ids-only context and a run cap: `src/autonomous_agent/triggers.py: TriggerHandler.handle_event()`
+- Stranded runs parked by a reaper: `src/autonomous_agent/reaper.py: reap_stranded()`
+- HTTP routes (202 plan, start, resume, decision, status, chat): `src/autonomous_agent/api.py: create_app()`
+
+**What is not built / simplified here**
+
+- No scheduler. A plan stores an RRULE and `next_runs()` computes dates, but nothing fires them.
+- The LLM, grounder, step agent and chat orchestrator are fakes behind Protocols. No real adapters.
+- Background tasks are in memory. There is no reaper loop; you call `reap_stranded` from your own timer.
+- No auth on the routes, and no backoff on retries.
+- Webhooks are a blocking POST with no retry queue.
+- A crash between a write and its ledger insert can repeat that write once.
+- Same-name entities are not handled: the fake grounder keys entities by name.
+
+**How a goal becomes a plan and then a run**
+
+1. A goal comes in. `POST /plans` (`api.py: create_plan`) answers 202 and plans in the background (`planner.py: create_plan_in_background()`). A plan lock and a 10-minute reuse check stop a retry from paying for the LLM twice (`planner.py: Planner.create_plan()`).
+2. Grounding maps names in the goal to real ids (`grounding.py: Grounder.ground()`).
+3. The LLM extracts only steps, branches, schedule, event and confidence. It never writes ids (`llm.py: PlanExtractor.extract()`).
+4. Code assembles the plan: step ids, dependencies, scope ids from grounding, the RRULE and the trigger type. Bad plans are refused here (`assembler.py: assemble()`).
+5. The plan is saved and `plan.ready` is emitted, or `plan.failed` if refused (`planner.py: Planner.create_plan()`, `store.py: save_plan()`).
+6. A run is created `pending`, by hand or by an event (`runs.py: RunManager.create()`, `triggers.py: handle_event()`). Start claims it atomically and gives a fencing token (`runs.py: start()`, `executor.py: Executor.claim()`).
+7. The executor loops. Each turn the agent proposes tool calls. Writes go through the gate, the ledger and the 150-write cap. The loop guard blocks repeats, soft on the 3rd identical call and hard on the 4th. The turn budget is 90 (`executor.py: _drive()`, `_call()`, `_write()`, `loop_guard.py: LoopGuard`). Final status comes from the stored step states (`executor.py: _finalise()`).
+8. Anything unfinished is parked: budget used, repeated transient failure, loop, crash, cancel or a lost worker. A gate hold parks it as `awaiting_approval`. Resume claims the row again, and the ledger makes repeated writes no-ops (`runs.py: claim_for_resume()`, `executor.py: run_claimed()`, `reaper.py: reap_stranded()`, `POST /runs/{id}/decision`).
+
+**Run it**
+
+```bash
+.venv/bin/pytest -q
+```
+
+Current result: 148 passed. No network, no API keys. `.venv/bin/python examples/demo.py` shows the same flow end to end.
+
 ## The problem
 
 "Every Monday, move overdue tasks in project Apollo to Blocked and create a review task." Someone
