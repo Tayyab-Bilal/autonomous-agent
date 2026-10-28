@@ -56,6 +56,89 @@ A planner and executor that turn a plain-English goal into a durable plan, then 
 
 Current result: 148 passed. No network, no API keys. `.venv/bin/python examples/demo.py` shows the same flow end to end.
 
+## How each part works, one by one
+
+Seven mechanisms make this repo safe to leave alone. Each one below says what goes wrong without it, how it works, and which tests prove it.
+
+### 1. The model never writes an id or a schedule
+
+- **Risk / problem:** If the LLM wrote ids, schedules or trigger names, one made-up value would become a real write at 9am on a Monday with nobody watching.
+- **How it works:**
+  - The goal is first matched against the real workspace, so names like "Apollo" turn into real ids before the model is even asked (`grounding.py: Grounder.ground()`).
+  - The model only returns intent: step descriptions, the names it referred to, a schedule in words, an event name and how sure it is. It has no field where an id could go (`llm.py: ExtractedPlan`).
+  - Plain code then builds the plan. It hands out the step ids itself, links the dependencies, and turns the schedule words into a standard recurrence rule. It also checks that rule and the timezone, so a malformed one is rejected (`assembler.py: assemble()`, `schedule_to_rrule()`).
+  - A scope id is only accepted if grounding returned it for that name. A name the model invented has nothing to resolve to, so the plan is refused.
+  - Event names go through a fixed map to trigger types the backend can really fire. A name with no match is dropped and listed in the plan, not guessed (`assembler.py: EVENT_MAP`).
+- **Tests that prove it:** `tests/test_assembler.py`: `test_llm_cannot_inject_ids`, `test_scope_resolves_only_through_grounding`, `test_rrule_next_runs_respect_timezone_dst`, and 11 more in that file.
+
+### 2. Plans that can never work are refused
+
+- **Risk / problem:** A plan with no steps, a loop in its dependencies, or no way to start would be saved and then fail again and again, or worse, be guessed into something the user never asked for.
+- **How it works:**
+  - Assembly checks the plan before anything is saved. It refuses when the model says it needs clarification, when there are zero steps, when a dependency points nowhere or goes in a circle, when a name is not in grounding, and when there is neither a usable schedule nor a usable event (`assembler.py: assemble()`).
+  - Every refusal carries a reason and a readable detail, so the person sees why and can fix the goal.
+  - A refused plan is not stored and is not reused. The planner just emits a "plan failed" event with that reason (`planner.py: Planner.create_plan()`).
+  - A bad schedule or an unmappable event is dropped without crashing. The plan only fails if nothing usable is left to start it.
+- **Tests that prove it:** `tests/test_assembler.py`: `test_dependency_cycle_rejected`, `test_zero_steps_refused`, `test_all_triggers_dropped_refuses`, and 11 more in that file. `tests/test_planner.py`: `test_refusal_is_not_persisted_or_reused`.
+
+### 3. A retried request does not pay for the LLM twice
+
+- **Risk / problem:** Clients retry. Without protection, two identical requests would make two LLM calls and save two plans.
+- **How it works:**
+  - Each request gets a fingerprint from the user and the goal text, with case and spacing ignored. Reuse is per tenant and per user, never across users (`planner.py: goal_hash()`).
+  - Planning for one fingerprint runs under a lock. The lock is a database row that must be inserted first, so only one request can hold it. The loser is told to retry later (`store.py: plan_lock()`).
+  - The lock expires after five minutes, so a dead worker cannot block that goal forever. Release checks the owner, so a slow worker whose lock expired cannot free the next worker's lock.
+  - Inside the lock, the planner first looks for a plan saved for the same fingerprint in the last ten minutes. If there is one, it returns it and never calls the LLM (`store.py: find_recent_plan()`).
+  - The HTTP route answers at once with 202 and plans in the background, so a slow LLM cannot hit a gateway timeout. The result arrives as an event (`planner.py: create_plan_in_background()`).
+- **Tests that prove it:** `tests/test_planner.py`: `test_retry_within_window_reuses_plan_and_does_not_call_llm_twice`, `test_slow_extractor_concurrent_requests_make_one_llm_call`, `test_expired_holder_does_not_release_the_new_holders_lock`, and 9 more in that file. `tests/test_api.py`: `test_post_plans_answers_202_at_once_and_plans_in_the_background`.
+
+### 4. Only one worker owns a run: atomic claims, fencing tokens, the reaper
+
+- **Risk / problem:** Two workers driving the same run would double every write. A worker that died, or was cut off, could wake up later and keep writing.
+- **How it works:**
+  - A run can only move along a fixed set of allowed steps, for example pending to running, or parked to running. Anything else raises an error (`runs.py: TRANSITIONS`).
+  - Starting or resuming is one conditional database update: "set running, but only if the status is still what I expect". If two workers race, the database lets one through and the other gets a conflict (HTTP 409) (`runs.py: RunManager.claim_for_resume()`, `store.py: update_status()`).
+  - Each successful claim bumps a counter on the run, and that number is the fencing token the worker carries. Every later heartbeat, step update and write checks that the token still matches, so a worker that lost the run is stopped before it writes (`store.py: check_fence()`).
+  - The reaper looks for runs marked running whose last heartbeat is older than 60 minutes and parks them so they can be resumed. The age check is repeated inside the update itself, so a run that beat in the meantime is left alone (`reaper.py: reap_stranded()`).
+  - On shutdown, a cancelled run parks itself before the cancel continues, so the park cannot be lost (`executor.py: Executor.run_claimed()`).
+  - Simplification: nothing calls the reaper on a timer here. You call it from your own scheduler.
+- **Tests that prove it:** `tests/test_runs.py`: `test_double_resume_one_wins_one_conflicts`, `test_fencing_token_cuts_off_a_replaced_worker`, `test_illegal_transition_raises`, and 6 more in that file. `tests/test_reaper.py`: `test_heartbeat_between_scan_and_update_is_not_reaped`, `test_stranded_running_run_is_parked`, and 3 more in that file. `tests/test_executor.py`: `test_reaped_worker_is_fenced_out_and_cannot_write`, `test_execute_refuses_a_run_someone_else_is_driving`. `tests/test_executor_failures.py`: `test_cancelled_run_is_parked_then_reraises`.
+
+### 5. Hard limits and the loop guard
+
+- **Risk / problem:** An unattended agent can burn money in a loop, make endless writes, or be resumed forever.
+- **How it works:**
+  - A run gets 90 turns per drive, then it parks and can be resumed. Transient failures are retried twice in the same turn, then the run parks (`executor.py: ExecConfig`, `Executor._drive()`).
+  - Real writes are capped at 150 per run, and the count is stored on the run, so resuming does not reset it. Hitting the cap fails the run (`executor.py: Executor._write()`).
+  - A run can be resumed at most three times over its life. Resumes after an approval do not count. And once a plan has had three failed runs, new runs for it are refused (`runs.py: RunManager.create()`).
+  - The loop guard watches the agent's calls. It spots the same call giving the same result, a short cycle of calls going round, or a read tool being polled with no change. The third identical call is blocked and the agent gets a message asking it to try something else (`loop_guard.py: LoopGuard.check()`).
+  - If the agent repeats the pattern anyway, the next try stops the run and parks it. If the agent does something new after a nudge, the warning resets. The same call with a changing result is never counted as a loop.
+- **Tests that prove it:** `tests/test_loop_guard.py`: `test_identical_call_soft_on_third_hard_on_fourth`, `test_same_call_with_changing_results_is_not_a_loop`, `test_nudges_reset_after_a_genuinely_different_call`, and 8 more in that file. `tests/test_executor.py`: `test_step_budget_parks_resumable`, `test_write_cap_shared_across_resumes`, `test_lifetime_resume_limit_stops_endless_resuming`, `test_loop_guard_stops_a_looping_agent`. `tests/test_runs.py`: `test_plan_with_repeated_failed_runs_is_refused_with_a_readable_cause`.
+
+### 6. The write ledger, resume, and an honest final status
+
+- **Risk / problem:** After a crash or a pause, a resumed agent often repeats what it already did, and a write happens twice. An agent can also say "done" when it is not.
+- **How it works:**
+  - Before a write runs, the executor makes a fingerprint from the tool name and its arguments. Argument order does not matter, null values are ignored, and `1`, `"1"` and `1.0` count as the same number (`executor.py: idempotency_key()`).
+  - If that fingerprint is already in the run's ledger, the stored result is returned and the tool is not called again. So a resumed agent that repeats a write gets a no-op (`executor.py: Executor._write()`).
+  - The write count and the ledger row are saved together in one transaction, and only if this worker still holds the run (`store.py: record_write()`).
+  - On every turn the agent is shown the plan again, with each step's state, its notes and which writes already ran. That stops it redoing a step against a new target (`executor.py: Executor._view()`).
+  - The final status is worked out from the stored step states, not from the agent's words. Any failed step fails the run, unsettled steps park it, and a run where everything was blocked or nothing was done is failed (`executor.py: Executor._finalise()`).
+  - A write the gate holds parks the run as awaiting approval. The approval covers only that exact call (`gate.py: ToolPolicyGate.check()`).
+  - Simplification: if a crash lands between a write and its ledger row, that one write can repeat. This is at-least-once with de-duplication, not exactly-once.
+- **Tests that prove it:** `tests/test_executor.py`: `test_resume_does_not_repeat_successful_write`, `test_equivalent_args_are_one_write`, `test_exception_never_completes`, and 26 more in that file. `tests/test_reconcile.py`: `test_executed_step_is_marked_already_executed_after_resume`. `tests/test_executor_failures.py`: `test_approval_is_for_the_held_call_only`, `test_gate_hold_parks_awaiting_approval`.
+
+### 7. Event triggers carry ids only
+
+- **Risk / problem:** An incoming event can hold user text, such as a task title that says "ignore previous instructions". If that reached the agent it would be a prompt injection. A duplicate or a flood of events could also start too many runs.
+- **How it works:**
+  - Only a fixed list of keys is copied into the run context, such as project id or task id. Even then a value must look like an id, not a sentence, so free text is dropped (`triggers.py: ALLOWED_CONTEXT_KEYS`, `_is_id()`).
+  - The agent reads titles and descriptions through its own tools later, so they stay data and never become instructions.
+  - A plan only matches if its trigger type fits the event and its scope ids overlap the ids in the event. An event for something out of scope is skipped quietly, not answered with an error the sender would retry forever (`triggers.py: TriggerHandler.handle_event()`).
+  - Claiming the event id, checking the cap and creating the runs all happen in one transaction. Two events at once cannot both slip under the cap of three runs at a time, and a failure part-way rolls the claim back so a redelivery is still processed.
+  - Only event-started runs count toward that cap, so a person starting a run by hand is never blocked by an event storm.
+- **Tests that prove it:** `tests/test_triggers.py`: `test_free_text_stripped_from_event_context`, `test_concurrent_events_cannot_both_slip_under_the_cap`, `test_duplicate_event_ignored`, and 7 more in that file. `tests/test_api.py`: `test_event_run_cap_is_429`.
+
 ## The problem
 
 "Every Monday, move overdue tasks in project Apollo to Blocked and create a review task." Someone
